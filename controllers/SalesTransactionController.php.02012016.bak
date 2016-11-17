@@ -1,0 +1,293 @@
+<?php
+
+namespace frontend\controllers;
+
+use Yii;
+use app\models\Batch;
+use app\models\Journal;
+use app\models\SalesTransaction;
+use app\models\SalesTransactionSearch;
+use yii\web\Controller;
+use yii\web\NotFoundHttpException;
+use yii\filters\VerbFilter;
+
+/**
+ * SalesTransactionController implements the CRUD actions for SalesTransaction model.
+ */
+class SalesTransactionController extends Controller
+{
+    public function behaviors()
+    {
+        return [
+            'verbs' => [
+                'class' => VerbFilter::className(),
+                'actions' => [
+                    'delete' => ['POST'],
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * Lists all SalesTransaction models.
+     * @return mixed
+     */
+    public function actionIndex()
+    {
+        $searchModel = new SalesTransactionSearch();
+        $dataProvider = $searchModel->search(Yii::$app->request->queryParams);
+
+        return $this->render('index', [
+            'searchModel' => $searchModel,
+            'dataProvider' => $dataProvider,
+        ]);
+    }
+
+    /**
+     * Displays a single SalesTransaction model.
+     * @param integer $id
+     * @return mixed
+     */
+    public function actionView($id)
+    {
+        return $this->renderAjax('view', [
+            'model' => $this->findModel($id),
+        ]);
+    }
+
+    /**
+     * Creates a new SalesTransaction model.
+     * If creation is successful, the browser will be redirected to the 'view' page.
+     * @return mixed
+     */
+    public function actionCreate($relation_id)
+    {
+        $user_id = \Yii::$app->user->identity->id;
+
+        $model = new SalesTransaction();
+        $model->loadDefaultValues();
+        $model->sales_id = $relation_id;
+        $model->create_user_id = $user_id;
+        $model->create_date = date('Y-m-d');
+
+        if ($model->load(Yii::$app->request->post()) && $model->save()) {
+            $model->calculatePaidAmount();
+            return $this->redirect(['sales/update', 'id' => $model->sales_id]);
+        } else {
+            return $this->renderAjax('create', [
+                'model' => $model,
+            ]);
+        }
+    }
+
+    /**
+     * Updates an existing SalesTransaction model.
+     * If update is successful, the browser will be redirected to the 'view' page.
+     * @param integer $id
+     * @return mixed
+     */
+    public function actionUpdate($id)
+    {
+        $model = $this->findModel($id);
+
+        if ($model->load(Yii::$app->request->post()) && $model->save()) {
+            return $this->redirect(['view', 'id' => $model->sales_transaction_id]);
+        } else {
+            return $this->render('update', [
+                'model' => $model,
+            ]);
+        }
+    }
+
+    /**
+     * Deletes an existing SalesTransaction model.
+     * If deletion is successful, the browser will be redirected to the 'index' page.
+     * @param integer $id
+     * @return mixed
+     */
+    public function actionDelete($id)
+    {
+        $this->findModel($id)->delete();
+
+        return $this->redirect(['index']);
+    }
+
+    /***
+    * Void a transaction
+    */
+    public function actionVoid($id)
+    {
+        $model = $this->findModel($id);
+        if($model !== null ){
+            $model->void = true;
+            $model->record_status = 'inactive';
+            $model->update_user_id = \Yii::$app->user->identity->id;
+            $model->update_date = date('Y-m-d');                
+            $model->update();
+
+            $model->calculatePaidAmount();
+
+            // Recalculate paid amount
+            // Pass transaction to Accounting Module
+            return $this->redirect(['sales/update', 'id' => $model->sales_id]);
+        }else {
+            throw new NotFoundHttpException('The requested page does not exist.');
+        }
+    }
+
+
+
+    public function getPaidAmount($sales_id)
+    {   
+        $model = SalesTransaction::find()
+            ->where(['sales_id'=>$sales_id])
+            ->andWhere(['void'=>false])
+            ->andWhere(['sales_transaction_type_id'=>SalesTransaction::SALES_RECEIPT_TRANSACTION_TYPE_ID])
+            ->andWhere(['record_status'=> SalesTransaction::ACTIVE]);
+
+        return ($model !== null) ? $model->sum('paid_amount') : 0.00;
+    }
+
+    public function setPaidAmount($sales_id)
+    {
+        $model = Sales::findOne($sales_id);
+        if($model !== null)
+        {
+            $model->paid_amount = $this->getPaidAmount($sales_id);
+            $model->save();
+        }   
+    }
+
+    /**
+    * Create a new batch each day.
+    * @return int batch_id
+    */
+    public function actionCreateBatch()
+    {
+        // Today's batch
+        $batch_name = 'SALES-'. date('Ymd') . '-' . \Yii::$app->user->identity->id;
+        $batch = Batch::findOne(['batch_name' => $batch_name]);
+        if($batch === null){
+            $batch = new Batch();
+            $batch->loadDefaultValues();
+            $batch->batch_name = $batch_name;
+            $batch->batch_date = date('Y-m-d');
+            $batch->save();
+        }
+        return $batch->batch_id;
+    }
+
+    /**
+    * Create a new journal
+    * @param [$batch_id, $journal_type_id]
+    * @return Journal
+    */
+    public function actionCreateJournal(array $params)
+    {
+        $journal = new Journal();
+        $journal->batch_id = $params->batch_id;
+        $journal->journal_type_id = $params->journal_type_id;
+        $journal->save();
+        // return $journal->journal_id;
+        print_r($params);
+
+    }
+
+    /**
+    *
+    */
+    public function getDebitCreditAccounts($sales_transaction_type)
+    {
+        //get current debit and credit account
+        $sales_transaction_type = SalesTransactionType::findOne(['sales_transaction_type_id'=>self::INVOICE_TRNX_TYPE_ID]);
+        if($sales_transaction_type !== null){
+            return $sales_transaction_type;
+        }else {
+            throw new NotFoundHttpException('The requested page does not exist.');
+        }
+    }
+
+    /**
+    * Populate Journal
+    * $sales_transaction_type_id debit_account_id/credit_account_id
+    * @param [$journal_id. $trnx_type_id, $amount]
+    * @return boolean success
+    */
+    public function populateJournal($params)
+    {
+        $posting = new Posting();
+        $posting->loadDefaultValues();
+        $posting->journal_id = $params->journal_id;
+        $posting->account_id = $params->account_id; 
+        // $posting->quantity = self::QUANTITY;
+        $posting->unit_amount = $this->final_sales_amount;
+        $posting->total_amount = $this->final_sales_amount;
+        // $posting->posting_status = self::POSTING_STATUS;
+        $posting->asset_type_id = self::ASSET_TYPE;
+        $posting->accounting_period_id = $accounting_period->accounting_period_id;
+        $posting->journal_owner_id = $this->create_user_id;
+        return $posting->save();
+    }
+
+    /**
+    * Set vehicle stock status
+    * @param [vehicle_id, stock_status_id, record_status]
+    * @return boolean success 
+    */
+    public function vehicleStockStatus($params)
+    {
+        /*** Update Vehicle Status ***/
+        $vehicle = Vehicle::findOne($params->vehicle_id);
+        $vehicle->stock_status_id = $params->stock_status_id;
+        $vehicle->record_status = $params->record_status;
+        $vehicle->update();
+    }
+
+    public function actionReport($id)
+    {
+        $model = $this->findModel($id);
+        $htmlContent = '';
+
+        $htmlContent .= '<pagebreak sheet-size="A5-L" />';
+        // Set page headers
+        $htmlContent .= $this->renderPartial('@app/views/report/_header');
+        // get your HTML raw content without any layouts or scripts
+        $htmlContent .= $this->renderPartial('_report-view',[
+                'model' => $model,
+            ]);
+
+        Yii::$app->response->format = \yii\web\Response::FORMAT_RAW;
+        $headers = Yii::$app->response->headers;
+        $headers->add('Content-Type', 'application/pdf');
+
+        $pdf = Yii::$app->pdf;
+        $pdf->methods = [ 'SetHeader'=>['Sales Transaction| |Fleet-21 Report|'], 
+            'SetFooter'=>['Skymouse Fleet-21 Sales Transaction Report|{PAGENO}|{DATE j-F-Y}'],
+        ];
+        $pdf->content = $htmlContent;
+        $pdf->options =  [
+                'title' => 'Sales Transaction Report No.' . $id,
+                'subject' => 'Fleet 21: Sales Transaction Report No.' . $id,
+                'output' => 'fleet21_sales_trnx_report.pdf',
+                'keywords' => 'skymouse fleet-21 sales report',
+                'author' => 'SKYMOUSE Fleet-21',
+                'creator' => 'SKYMOUSE Fleet-21'];
+        return $pdf->render();
+    }
+
+    /**
+     * Finds the SalesTransaction model based on its primary key value.
+     * If the model is not found, a 404 HTTP exception will be thrown.
+     * @param integer $id
+     * @return SalesTransaction the loaded model
+     * @throws NotFoundHttpException if the model cannot be found
+     */
+    protected function findModel($id)
+    {
+        if (($model = SalesTransaction::findOne($id)) !== null) {
+            return $model;
+        } else {
+            throw new NotFoundHttpException('The requested page does not exist.');
+        }
+    }
+}
